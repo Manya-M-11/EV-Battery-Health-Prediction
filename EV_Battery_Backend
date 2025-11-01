@@ -1,0 +1,402 @@
+# Flask API Backend for EV Battery Life Prediction
+"""
+Install required packages:
+pip install flask flask-cors openai
+"""
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import pickle
+import numpy as np
+import pandas as pd
+from datetime import datetime
+import os
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for React frontend
+
+# Load the trained model
+MODEL_PATH = 'battery_predictor.pkl'
+
+class BatteryPredictionAPI:
+    def __init__(self):
+        self.model_data = None
+        self.load_model()
+    
+    def load_model(self):
+        """Load the trained ML model"""
+        try:
+            with open(MODEL_PATH, 'rb') as f:
+                self.model_data = pickle.load(f)
+            print("Model loaded successfully!")
+        except FileNotFoundError:
+            print("Model not found. Please train the model first.")
+            self.model_data = None
+    
+    def predict(self, input_data):
+        """Make prediction using the loaded model"""
+        if self.model_data is None:
+            return None
+        
+        # Prepare input data
+        df = pd.DataFrame([input_data])
+        
+        # Ensure all required features are present
+        for col in self.model_data['feature_columns']:
+            if col not in df.columns:
+                df[col] = 0  # Default value for missing features
+        
+        # Select only the required features
+        X = df[self.model_data['feature_columns']]
+        
+        # Scale and predict
+        X_scaled = self.model_data['scaler'].transform(X)
+        soh_pred = self.model_data['model'].predict(X_scaled)[0]
+        
+        # Calculate RUL
+        eol_threshold = 70
+        if soh_pred <= eol_threshold:
+            rul = 0
+        else:
+            rul = int((soh_pred - eol_threshold) * 10)
+        
+        return {
+            'soh': float(soh_pred),
+            'rul_cycles': int(rul),
+            'health_status': self.get_health_status(soh_pred)
+        }
+    
+    def get_health_status(self, soh):
+        """Determine battery health status"""
+        if soh > 90:
+            return 'EXCELLENT'
+        elif soh > 80:
+            return 'GOOD'
+        elif soh > 70:
+            return 'FAIR'
+        else:
+            return 'POOR'
+    
+    def generate_recommendations(self, soh, temp, voltage):
+        """Generate care recommendations"""
+        recommendations = []
+        
+        if soh < 70:
+            recommendations.append({
+                'priority': 'HIGH',
+                'category': 'Battery Health',
+                'message': 'Battery is nearing end-of-life. Consider replacement planning.',
+                'action': 'Schedule service appointment'
+            })
+        elif soh < 80:
+            recommendations.append({
+                'priority': 'MEDIUM',
+                'category': 'Battery Health',
+                'message': 'Battery showing moderate degradation.',
+                'action': 'Follow optimal charging practices'
+            })
+        
+        if temp > 35:
+            recommendations.append({
+                'priority': 'HIGH',
+                'category': 'Temperature',
+                'message': 'High temperature detected. This accelerates battery degradation.',
+                'action': 'Park in shade, avoid fast charging in heat'
+            })
+        elif temp < 0:
+            recommendations.append({
+                'priority': 'MEDIUM',
+                'category': 'Temperature',
+                'message': 'Cold temperature affects battery performance.',
+                'action': 'Precondition battery before driving'
+            })
+        
+        recommendations.append({
+            'priority': 'LOW',
+            'category': 'Charging',
+            'message': 'Maintain charge between 20-80% for daily use.',
+            'action': 'Set charge limit in vehicle settings'
+        })
+        
+        recommendations.append({
+            'priority': 'LOW',
+            'category': 'Charging',
+            'message': 'Avoid frequent fast charging.',
+            'action': 'Use Level 2 charging when possible'
+        })
+        
+        return recommendations
+
+# Initialize API
+battery_api = BatteryPredictionAPI()
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'model_loaded': battery_api.model_data is not None
+    })
+
+@app.route('/api/predict', methods=['POST'])
+def predict_battery_life():
+    """
+    Predict battery SOH and RUL
+    
+    Expected input:
+    {
+        "voltage_mean": 3.6,
+        "current_mean": 1.5,
+        "temp_mean": 25,
+        "cycle_number": 100,
+        "voltage_std": 0.1,
+        "voltage_min": 2.5,
+        "voltage_max": 4.2,
+        "current_std": 0.2,
+        "temp_std": 2,
+        "temp_max": 30,
+        "ambient_temp": 22
+    }
+    """
+    try:
+        data = request.json
+        
+        if battery_api.model_data is None:
+            return jsonify({
+                'error': 'Model not loaded. Please train the model first.'
+            }), 503
+        
+        # Make prediction
+        result = battery_api.predict(data)
+        
+        if result is None:
+            return jsonify({'error': 'Prediction failed'}), 500
+        
+        return jsonify({
+            'success': True,
+            'prediction': result,
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    except Exception as e:
+        return jsonify({
+            'error': str(e)
+        }), 400
+
+@app.route('/api/recommendations', methods=['POST'])
+def get_recommendations():
+    """
+    Get battery care recommendations
+    
+    Expected input:
+    {
+        "soh": 85.5,
+        "temp_mean": 28,
+        "voltage_mean": 3.6
+    }
+    """
+    try:
+        data = request.json
+        soh = data.get('soh', 90)
+        temp = data.get('temp_mean', 25)
+        voltage = data.get('voltage_mean', 3.6)
+        
+        recommendations = battery_api.generate_recommendations(soh, temp, voltage)
+        
+        return jsonify({
+            'success': True,
+            'recommendations': recommendations,
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    except Exception as e:
+        return jsonify({
+            'error': str(e)
+        }), 400
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze_battery():
+    """
+    Complete battery analysis: prediction + recommendations
+    
+    Expected input: Same as /api/predict
+    """
+    try:
+        data = request.json
+        
+        if battery_api.model_data is None:
+            return jsonify({
+                'error': 'Model not loaded. Please train the model first.'
+            }), 503
+        
+        # Make prediction
+        prediction = battery_api.predict(data)
+        
+        if prediction is None:
+            return jsonify({'error': 'Prediction failed'}), 500
+        
+        # Get recommendations
+        recommendations = battery_api.generate_recommendations(
+            prediction['soh'],
+            data.get('temp_mean', 25),
+            data.get('voltage_mean', 3.6)
+        )
+        
+        # Generate summary
+        summary = {
+            'health_score': prediction['soh'],
+            'health_status': prediction['health_status'],
+            'remaining_useful_life': {
+                'cycles': prediction['rul_cycles'],
+                'estimated_months': int(prediction['rul_cycles'] / 30)  # Assuming 1 cycle/day
+            },
+            'risk_factors': [],
+            'maintenance_required': prediction['soh'] < 80
+        }
+        
+        # Identify risk factors
+        if data.get('temp_mean', 25) > 35:
+            summary['risk_factors'].append('High operating temperature')
+        if data.get('temp_mean', 25) < 0:
+            summary['risk_factors'].append('Cold temperature operation')
+        if prediction['soh'] < 80:
+            summary['risk_factors'].append('Advanced battery degradation')
+        
+        return jsonify({
+            'success': True,
+            'summary': summary,
+            'detailed_prediction': prediction,
+            'recommendations': recommendations,
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    except Exception as e:
+        return jsonify({
+            'error': str(e)
+        }), 400
+
+@app.route('/api/upload-data', methods=['POST'])
+def upload_battery_data():
+    """
+    Upload historical battery data for analysis
+    """
+    try:
+        data = request.json
+        
+        # Validate data format
+        if not isinstance(data, list):
+            return jsonify({
+                'error': 'Data must be a list of measurements'
+            }), 400
+        
+        # Process batch predictions
+        results = []
+        for measurement in data:
+            prediction = battery_api.predict(measurement)
+            if prediction:
+                results.append({
+                    'cycle': measurement.get('cycle_number', 0),
+                    'soh': prediction['soh'],
+                    'rul': prediction['rul_cycles']
+                })
+        
+        # Calculate trends
+        if len(results) > 1:
+            soh_values = [r['soh'] for r in results]
+            avg_degradation = (soh_values[0] - soh_values[-1]) / len(results)
+        else:
+            avg_degradation = 0
+        
+        return jsonify({
+            'success': True,
+            'total_cycles': len(results),
+            'predictions': results,
+            'trends': {
+                'average_degradation_per_cycle': float(avg_degradation),
+                'current_soh': results[-1]['soh'] if results else 0,
+                'estimated_rul': results[-1]['rul'] if results else 0
+            },
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    except Exception as e:
+        return jsonify({
+            'error': str(e)
+        }), 400
+
+# ============================================================================
+# DOCUMENTATION ENDPOINT
+# ============================================================================
+
+@app.route('/api/docs', methods=['GET'])
+def api_documentation():
+    """API documentation"""
+    docs = {
+        'endpoints': {
+            '/api/health': {
+                'method': 'GET',
+                'description': 'Check API health status'
+            },
+            '/api/predict': {
+                'method': 'POST',
+                'description': 'Predict battery SOH and RUL',
+                'input_example': {
+                    'voltage_mean': 3.6,
+                    'current_mean': 1.5,
+                    'temp_mean': 25,
+                    'cycle_number': 100
+                }
+            },
+            '/api/recommendations': {
+                'method': 'POST',
+                'description': 'Get battery care recommendations',
+                'input_example': {
+                    'soh': 85.5,
+                    'temp_mean': 28,
+                    'voltage_mean': 3.6
+                }
+            },
+            '/api/analyze': {
+                'method': 'POST',
+                'description': 'Complete battery analysis with predictions and recommendations'
+            },
+            '/api/upload-data': {
+                'method': 'POST',
+                'description': 'Upload historical data for batch analysis',
+                'input_example': [
+                    {
+                        'voltage_mean': 3.6,
+                        'temp_mean': 25,
+                        'cycle_number': 1
+                    }
+                ]
+            }
+        }
+    }
+    return jsonify(docs)
+
+# ============================================================================
+# RUN SERVER
+# ============================================================================
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("EV BATTERY PREDICTION API SERVER")
+    print("=" * 60)
+    print("\nStarting Flask server...")
+    print("API will be available at: http://localhost:5000")
+    print("\nAvailable endpoints:")
+    print("  - GET  /api/health")
+    print("  - POST /api/predict")
+    print("  - POST /api/recommendations")
+    print("  - POST /api/analyze")
+    print("  - POST /api/upload-data")
+    print("  - GET  /api/docs")
+    print("\n" + "=" * 60)
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
